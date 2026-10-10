@@ -1,0 +1,323 @@
+diff --git a/crates/ui-egui/src/panels/properties.rs b/crates/ui-egui/src/panels/properties.rs
+index 9cc6546..3488414 100644
+--- a/crates/ui-egui/src/panels/properties.rs
++++ b/crates/ui-egui/src/panels/properties.rs
+@@ -332,13 +332,7 @@ fn text_section(
+     // Font family and style.
+     let fr = Rect::from_min_size(pos2(x0, y), vec2(w, 22.0));
+     let pop = egui::Id::new("props-font-pop");
+-    if widgets::dropdown(ui, fr, &doc.font, &t, egui::Id::new("props-font")).clicked() {
+-        widgets::open_popup(ui, pop);
+-    }
+-    app.auto.add("properties.text.font", fr, "Font family");
+-    // Every installed family (built only while the menu is open: it can be long).
+-    let fams: Vec<String> = if widgets::popup_is_open(ui, pop) { effectcraft_engine::text_families() } else { vec![] };
+-    if let Some(f) = widgets::popup_menu(ui, pop, fr.left_bottom(), &fams, fams.iter().position(|f| *f == doc.font)).and_then(|i| fams.get(i)) {
++    if let Some(f) = super::text_panels::font_picker(app, ui, pop, fr, &doc.font, "properties.text.font", true) {
+         set(actions, json!({"font": f}));
+     }
+     y += 28.0;
+diff --git a/crates/ui-egui/src/panels/text_panels.rs b/crates/ui-egui/src/panels/text_panels.rs
+index de4f6c9..911f56f 100644
+--- a/crates/ui-egui/src/panels/text_panels.rs
++++ b/crates/ui-egui/src/panels/text_panels.rs
+@@ -93,11 +93,7 @@ pub fn character(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
+     // Font family + style.
+     let fr = Rect::from_min_size(pos2(x0, y), vec2(w, 22.0));
+     let pop = egui::Id::new("char-font-pop");
+-    if widgets::dropdown(ui, fr, &doc.font, &t, egui::Id::new("char-font")).clicked() && enabled {
+-        widgets::open_popup(ui, pop);
+-    }
+-    app.auto.add("character.font", fr, "Font family");
+-    if let Some(f) = font_popup(app, ui, pop, fr.left_bottom(), &doc.font) {
++    if let Some(f) = font_picker(app, ui, pop, fr, &doc.font, "character.font", enabled) {
+         actions.push(json!({"font": f}));
+     }
+     y += 28.0;
+@@ -541,26 +537,130 @@ pub fn paragraph(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
+     }
+ }
+ 
+-/// The font menu: recent fonts first, names in English or the fonts' own language, and a
+-/// "Sample" preview in each font (Settings ▸ Type).
+-fn font_popup(app: &EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos: egui::Pos2, current: &str) -> Option<String> {
+-    if !ui.data(|d| d.get_temp::<bool>(id.with("open")).unwrap_or(false)) {
++#[derive(Clone, Default)]
++struct FontSearch {
++    query: String,
++    selected: usize,
++}
++
++/// Shared font menu for Character and Properties: search, recent fonts and previews.
++pub(super) fn font_picker(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, rect: Rect, current: &str, auto: &str, enabled: bool) -> Option<String> {
++    let state_id = id.with("search-state");
++    app.auto.add(auto, rect, "Font family");
++    if !widgets::popup_is_open(ui, id) || !enabled {
++        ui.data_mut(|d| d.remove::<FontSearch>(state_id));
++        if widgets::dropdown(ui, rect, current, &app.tokens, id.with("field")).clicked() && enabled {
++            widgets::open_popup(ui, id);
++        }
+         return None;
+     }
+     let rows = effectcraft_engine::font_menu(&app.session.prefs);
++    let saved = ui.data(|d| d.get_temp::<FontSearch>(state_id));
++    let fresh = saved.is_none();
++    let mut state = saved.unwrap_or_default();
++    let search_id = id.with("search");
++    let (up, down, enter, escape) = ui.input_mut(|i| {
++        (
++            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
++            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
++            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
++            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
++        )
++    });
+     let preview = app.session.prefs.type_.font_preview;
+     let t = app.tokens;
++    // The font field itself becomes editable. The popup contains only results.
++    let arrow = Rect::from_min_max(pos2(rect.max.x - 22.0, rect.min.y), rect.max);
++    let edit_rect = Rect::from_min_max(rect.min, pos2(arrow.min.x, rect.max.y));
++    let search = ui.put(edit_rect, egui::TextEdit::singleline(&mut state.query).id(search_id).hint_text(current).font(Tokens::ui(12.0)));
++    app.auto.add(&format!("{auto}.search"), search.rect, "Search fonts");
++    if fresh {
++        search.request_focus();
++    }
++    ui.memory_mut(|m| m.set_focus_lock_filter(search_id, egui::EventFilter { vertical_arrows: true, escape: true, ..Default::default() }));
++    if widgets::icon_button(ui, arrow, crate::icons::Icon::ChevronDown, false, &t, id.with("arrow")).clicked() {
++        ui.data_mut(|d| {
++            d.insert_temp(id.with("open"), false);
++            d.remove::<FontSearch>(state_id);
++        });
++        ui.memory_mut(|m| m.surrender_focus(search_id));
++        return None;
++    }
++    app.auto.add(&format!("{auto}.toggle"), arrow, "Close font list");
+     let mut chosen = None;
+-    let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
++    let screen = ui.ctx().content_rect();
++    let below = screen.bottom() - rect.bottom() - 16.0;
++    let above = below < 100.0 && rect.top() - screen.top() > below;
++    let max_height = (if above { rect.top() - screen.top() - 16.0 } else { below }).clamp(28.0, 380.0);
++    let anchor = if above { rect.left_top() } else { rect.left_bottom() };
++    let pivot = if above { Align2::LEFT_BOTTOM } else { Align2::LEFT_TOP };
++    let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).pivot(pivot).fixed_pos(anchor).show(ui.ctx(), |ui| {
+         egui::Frame::popup(ui.style()).show(ui, |ui| {
+-            ui.set_min_width(if preview { 300.0 } else { 180.0 });
+-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+-                for r in &rows {
+-                    if r.family.is_empty() {
++            ui.set_width(rect.width().max(180.0));
++            let query = state.query.trim().to_lowercase();
++            let mut seen = std::collections::HashSet::new();
++            let filtered: Vec<_> = rows
++                .iter()
++                .filter(|r| {
++                    !r.family.is_empty()
++                        && (query.is_empty()
++                            || ((r.family.to_lowercase().contains(&query) || r.display.to_lowercase().contains(&query)) && seen.insert(&r.family)))
++                })
++                .collect();
++            if fresh {
++                state.selected = filtered.iter().position(|r| r.family == current).unwrap_or(0);
++            }
++            if search.changed() {
++                state.selected = 0;
++            }
++            let last = filtered.len().saturating_sub(1);
++            state.selected = state.selected.min(last);
++            if down {
++                state.selected = state.selected.saturating_add(1).min(last);
++            }
++            if up {
++                state.selected = state.selected.saturating_sub(1);
++            }
++            if enter {
++                chosen = filtered.get(state.selected).map(|r| r.family.clone());
++            }
++            // Give the result list its actual height even when the previous query had
++            // only one row. A cached tiny Area must not collapse a reopened long list.
++            let height = (filtered.len() as f32 * (24.0 + ui.spacing().item_spacing.y) + 16.0).clamp(28.0, max_height);
++            ui.set_height(height);
++            let mut scroll = egui::ScrollArea::vertical().id_salt(id.with("results")).max_height(height).min_scrolled_height(height);
++            if search.changed() {
++                scroll = scroll.vertical_scroll_offset(0.0);
++            }
++            scroll.show(ui, |ui| {
++                if filtered.is_empty() {
++                    let r = ui.label("No matching fonts");
++                    app.auto.add(&format!("{auto}.empty"), r.rect, "No matching fonts");
++                }
++                let mut was_recent = false;
++                for (index, r) in filtered.iter().enumerate() {
++                    if query.is_empty() && was_recent && !r.recent {
+                         ui.separator();
+-                        continue;
+                     }
+-                    let resp = ui.selectable_label(r.family == current, &r.display);
++                    was_recent = r.recent;
++                    let row_width = ui.available_width();
++                    let label_width = if preview { row_width - 100.0 } else { row_width };
++                    let resp = ui.add_sized([row_width, 24.0], egui::Button::selectable(index == state.selected, ""));
++                    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), index == state.selected, &r.display));
++                    let label_rect = Rect::from_min_size(resp.rect.min + vec2(5.0, 0.0), vec2(label_width - 5.0, resp.rect.height()));
++                    ui.painter().with_clip_rect(label_rect.intersect(ui.clip_rect())).text(
++                        label_rect.left_center(),
++                        Align2::LEFT_CENTER,
++                        &r.display,
++                        Tokens::ui(12.0),
++                        t.text,
++                    );
++                    if ui.is_rect_visible(resp.rect) {
++                        app.auto.add(&format!("{auto}.option.{}", r.family), resp.rect, &r.display);
++                    }
++                    if index == state.selected && (fresh || up || down) {
++                        resp.scroll_to_me(None);
++                    }
+                     if preview && ui.is_rect_visible(resp.rect) {
+                         let key = egui::Id::new(("font-preview", &r.family));
+                         let lines: std::sync::Arc<Vec<Vec<[f32; 2]>>> = match ui.data(|d| d.get_temp(key)) {
+@@ -571,7 +671,7 @@ fn font_popup(app: &EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos: egui::
+                                 l
+                             }
+                         };
+-                        let o = pos2(resp.rect.max.x - 120.0, resp.rect.center().y + 5.0);
++                        let o = pos2(resp.rect.max.x - 90.0, resp.rect.center().y + 5.0);
+                         for poly in lines.iter() {
+                             let pts: Vec<egui::Pos2> = poly.iter().map(|p| o + vec2(p[0], p[1])).collect();
+                             ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.0, t.text_dim)));
+@@ -580,13 +680,20 @@ fn font_popup(app: &EffectcraftApp, ui: &mut egui::Ui, id: egui::Id, pos: egui::
+                     if resp.clicked() {
+                         chosen = Some(r.family.clone());
+                     }
++                    resp.on_hover_text(&r.display);
+                 }
+             });
+         });
+     });
+-    let outside = widgets::pressed_outside(ui.ctx(), &area.response);
+-    if chosen.is_some() || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+-        ui.data_mut(|d| d.insert_temp(id.with("open"), false));
++    let outside = widgets::pressed_outside(ui.ctx(), &area.response) && !ui.input(|i| i.pointer.interact_pos().is_some_and(|p| rect.contains(p)));
++    if chosen.is_some() || outside || escape {
++        ui.data_mut(|d| {
++            d.insert_temp(id.with("open"), false);
++            d.remove::<FontSearch>(state_id);
++        });
++        ui.memory_mut(|m| m.surrender_focus(search_id));
++    } else {
++        ui.data_mut(|d| d.insert_temp(state_id, state));
+     }
+     chosen
+ }
+diff --git a/crates/ui-egui/tests/ui_font_search.rs b/crates/ui-egui/tests/ui_font_search.rs
+new file mode 100644
+index 0000000..0af3643
+--- /dev/null
++++ b/crates/ui-egui/tests/ui_font_search.rs
+@@ -0,0 +1,106 @@
++//! Real keyboard/pointer coverage for the font menus in both text panels.
++use effectcraft_engine::{Session, commands::text_edit::layer_doc, project::LayerId};
++use effectcraft_ui_egui::{EffectcraftApp, dock::PanelKind};
++use egui::{Event, Key, Modifiers, PointerButton};
++use egui_kittest::Harness;
++use serde_json::json;
++
++fn click(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
++    let e = h.state().auto.find(id).unwrap_or_else(|| panic!("missing {id}")).clone();
++    let pos = egui::pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
++    h.input_mut().events.push(Event::PointerMoved(pos));
++    for pressed in [true, false] {
++        h.input_mut().events.push(Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
++        h.run_steps(2);
++    }
++}
++
++fn key(h: &mut Harness<'_, EffectcraftApp>, key: Key) {
++    for pressed in [true, false] {
++        h.input_mut().events.push(Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE });
++    }
++    h.run_steps(3);
++}
++
++fn type_text(h: &mut Harness<'_, EffectcraftApp>, text: &str) {
++    h.input_mut().events.push(Event::Text(text.into()));
++    h.run_steps(3);
++}
++
++#[test]
++fn font_search_filters_selects_and_undoes_in_both_panels() {
++    for (panel, prefix) in [(PanelKind::Character, "character.font"), (PanelKind::Properties, "properties.text.font")] {
++        let mut s = Session::default();
++        s.execute("comp.new", json!({"width": 320, "height": 180})).unwrap();
++        let lid = s.execute("layer.newText", json!({"text": "Keep this text", "font": "Inter"})).unwrap()["layer"].as_u64().unwrap();
++        let builder = Harness::builder().with_size(egui::vec2(1600.0, 1000.0));
++        let mut h = if std::env::var_os("EC_SNAPSHOT_DIR").is_some() {
++            builder.wgpu().build_eframe(move |_| EffectcraftApp::new(s))
++        } else {
++            builder.build_eframe(move |_| EffectcraftApp::new(s))
++        };
++        h.state_mut().show_panel(panel);
++        h.run_steps(3);
++        click(&mut h, prefix);
++        assert!(h.state().auto.find(&format!("{prefix}.search")).is_some());
++        let field = h.state().auto.find(prefix).unwrap();
++        let search = h.state().auto.find(&format!("{prefix}.search")).unwrap();
++        assert!(
++            (field.rect[1] + field.rect[3] / 2.0 - search.rect[1] - search.rect[3] / 2.0).abs() < 1.0,
++            "font selection and search must occupy the same row"
++        );
++        // Search gets focus on open. Mixed case and surrounding whitespace are accepted.
++        type_text(&mut h, "  jEtBrAiNs  ");
++        let rows = h.state().auto.query(&format!("{prefix}.option."));
++        assert!(!rows.is_empty());
++        assert!(rows.iter().all(|r| r.label.to_lowercase().contains("jetbrains")));
++        if let Ok(dir) = std::env::var("EC_SNAPSHOT_DIR") {
++            h.render().unwrap().save(format!("{dir}/{prefix}-search.png")).unwrap();
++        }
++        assert_eq!(layer_doc(&h.state().session, LayerId(lid)).unwrap().font, "Inter", "typing only filters");
++        key(&mut h, Key::Enter);
++        assert_eq!(layer_doc(&h.state().session, LayerId(lid)).unwrap().font, "JetBrains Mono");
++        assert_eq!(layer_doc(&h.state().session, LayerId(lid)).unwrap().text, "Keep this text");
++        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
++        assert_eq!(layer_doc(&h.state().session, LayerId(lid)).unwrap().font, "Inter");
++        click(&mut h, prefix);
++        type_text(&mut h, "no_such_font_123456789");
++        assert!(h.state().auto.query(&format!("{prefix}.option.")).is_empty());
++        assert!(h.state().auto.find(&format!("{prefix}.empty")).is_some());
++        key(&mut h, Key::Enter);
++        assert!(h.state().auto.find(&format!("{prefix}.search")).is_some(), "no result keeps menu open");
++        key(&mut h, Key::Escape);
++        assert_eq!(layer_doc(&h.state().session, LayerId(lid)).unwrap().font, "Inter");
++        click(&mut h, prefix);
++        // Reopening clears the previous query, and mouse selection still works.
++        h.run_steps(2);
++        if let Ok(dir) = std::env::var("EC_SNAPSHOT_DIR") {
++            h.render().unwrap().save(format!("{dir}/{prefix}-reopened.png")).unwrap();
++        }
++        assert!(h.state().auto.query(&format!("{prefix}.option.")).len() > 1);
++        type_text(&mut h, "JetBrains");
++        click(&mut h, &format!("{prefix}.option.JetBrains Mono"));
++        assert_eq!(layer_doc(&h.state().session, LayerId(lid)).unwrap().font, "JetBrains Mono");
++    }
++}
++
++#[test]
++fn font_search_preserves_edited_text_and_applies_only_to_selected_characters() {
++    let mut s = Session::default();
++    s.execute("comp.new", json!({"width": 320, "height": 180})).unwrap();
++    let lid = s.execute("layer.newText", json!({"text": "First second", "font": "Inter"})).unwrap()["layer"].as_u64().unwrap();
++    s.execute("text.edit", json!({"layer": lid})).unwrap();
++    s.execute("text.setSelection", json!({"start": 0, "end": 5})).unwrap();
++    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(move |_| EffectcraftApp::new(s));
++    h.state_mut().show_panel(PanelKind::Character);
++    h.run_steps(3);
++    click(&mut h, "character.font");
++    type_text(&mut h, "noto serif");
++    key(&mut h, Key::ArrowDown);
++    key(&mut h, Key::ArrowUp);
++    key(&mut h, Key::Enter);
++    let doc = layer_doc(&h.state().session, LayerId(lid)).unwrap();
++    assert_eq!(doc.text, "First second");
++    assert_eq!(doc.style_at(0).font, "Noto Serif");
++    assert_eq!(doc.style_at(8).font, "Inter");
++}

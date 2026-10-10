@@ -1,0 +1,995 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 980737a..6e92c95 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1345,8 +1345,10 @@ dependencies = [
+  "effectcraft-raster",
+  "effectcraft-script",
+  "effectcraft-svg",
++ "effectcraft-text-box",
+  "effectcraft-time",
+  "image",
++ "log",
+  "rayon",
+  "serde_json",
+ ]
+@@ -1579,6 +1581,15 @@ dependencies = [
+  "unicode-linebreak",
+ ]
+ 
++[[package]]
++name = "effectcraft-text-box"
++version = "1.1.0"
++dependencies = [
++ "effectcraft-effects",
++ "rayon",
++ "serde_json",
++]
++
+ [[package]]
+ name = "effectcraft-time"
+ version = "0.4.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index c35c673..6dd1530 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [workspace]
+ resolver = "3"
+-members = ["crates/*", "apps/*", "xtask"]
++members = ["crates/*", "apps/*", "xtask", "examples/plugins/text-box"]
+ default-members = ["crates/*", "apps/*"]
+ 
+ [workspace.package]
+diff --git a/crates/effects/src/plugin.rs b/crates/effects/src/plugin.rs
+index 874050f..f414795 100644
+--- a/crates/effects/src/plugin.rs
++++ b/crates/effects/src/plugin.rs
+@@ -227,6 +227,16 @@ pub trait EffectPlugin: Send + Sync {
+     /// Process `frame` in place. `time` is layer time in seconds. An error leaves the frame as
+     /// it was (the error is logged once).
+     fn render(&self, frame: &mut PluginFrame, params: &PluginParams, time: f64) -> Result<(), String>;
++    /// Rust host extension: return a new layer-space buffer, including expanded pixels.
++    /// Preserve `scale` and update `offset` when adding pixels on the left/top.
++    /// The default adapter preserves the v1 in-place contract (including WebAssembly).
++    /// An error leaves the original buffer unchanged.
++    fn render_buffer(&self, input: &Buf, params: &PluginParams, time: f64) -> Result<Buf, String> {
++        let mut output = input.clone();
++        let mut frame = PluginFrame { width: output.img.width, height: output.img.height, pixels: &mut output.img.data, scale: output.scale };
++        self.render(&mut frame, params, time)?;
++        Ok(output)
++    }
+     /// Where the plug-in came from (a file path, `built-in`…), for listings.
+     fn source(&self) -> String {
+         "built-in".into()
+@@ -337,12 +347,21 @@ fn run_slot(slot: usize, ctx: &EffectCtx, mut buf: Buf) -> Buf {
+     let m = plugin.manifest();
+     let flat = flatten(m, ctx, &buf);
+     let params = PluginParams { manifest: m, flat: &flat };
+-    let (width, height) = (buf.img.width, buf.img.height);
+-    let before = buf.img.data.clone();
+-    let mut frame = PluginFrame { width, height, pixels: &mut buf.img.data, scale: buf.scale };
+-    if let Err(e) = plugin.render(&mut frame, &params, ctx.time) {
+-        log::warn!("plug-in `{}`: {e}", m.id);
+-        buf.img.data = before;
++    match plugin.render_buffer(&buf, &params, ctx.time) {
++        Ok(output) => {
++            let count = (output.img.width as usize).checked_mul(output.img.height as usize);
++            if count != Some(output.img.data.len())
++                || !output.scale.is_finite()
++                || output.scale <= 0.0
++                || output.scale != buf.scale
++                || output.offset.iter().any(|v| !v.is_finite())
++            {
++                log::warn!("plug-in `{}` returned an invalid buffer", m.id);
++            } else {
++                buf = output;
++            }
++        }
++        Err(e) => log::warn!("plug-in `{}`: {e}", m.id),
+     }
+     buf
+ }
+diff --git a/crates/host/Cargo.toml b/crates/host/Cargo.toml
+index 948b782..4b8985e 100644
+--- a/crates/host/Cargo.toml
++++ b/crates/host/Cargo.toml
+@@ -10,6 +10,8 @@ rust-version.workspace = true
+ workspace = true
+ 
+ [dependencies]
++effectcraft-text-box = { path = "../../examples/plugins/text-box" }
++log = { workspace = true }
+ effectcraft-engine = { workspace = true }
+ effectcraft-project = { workspace = true }
+ effectcraft-media = { workspace = true }
+diff --git a/crates/host/src/lib.rs b/crates/host/src/lib.rs
+index b4ca00a..bf073c6 100644
+--- a/crates/host/src/lib.rs
++++ b/crates/host/src/lib.rs
+@@ -80,6 +80,10 @@ impl Exporter for FileExporter {
+ 
+ /// A new session with media, import, expressions, scripting and export enabled.
+ pub fn session() -> Session {
++    // Linked Rust plug-ins register once, before frontends build effect menus.
++    if let Err(e) = effectcraft_text_box::register() {
++        log::warn!("TextBox registration failed: {e}");
++    }
+     Session {
+         // The desktop app, the CLI and the MCP server share installed Roto Brush models.
+         models_dir: config_dir().map(|d| d.join("models")),
+diff --git a/crates/host/tests/text_box.rs b/crates/host/tests/text_box.rs
+new file mode 100644
+index 0000000..5eed033
+--- /dev/null
++++ b/crates/host/tests/text_box.rs
+@@ -0,0 +1,99 @@
++//! Regression: expanded plugin pixels survive source bounds through the real compositor.
++use effectcraft_engine::{Session, render::RenderOpts, time::Tick};
++use serde_json::json;
++
++fn prop(s: &mut Session, layer: u64, id: &str, value: serde_json::Value) {
++    s.execute("prop.set", json!({"layer":layer,"path":format!("effects/#1/{id}"),"value":value})).unwrap();
++}
++#[test]
++fn textbox_expands_solid_beyond_source_through_compositor() {
++    let mut s = effectcraft_host::session();
++    s.execute("comp.new", json!({"width":160,"height":100,"duration":2})).unwrap();
++    let l = s.execute("layer.newSolid", json!({"width":20,"height":10,"color":[1.0,0.0,0.0]})).unwrap()["layer"].as_u64().unwrap();
++    s.execute("effect.apply", json!({"layer":l,"effect":"TextBox"})).unwrap();
++    prop(&mut s, l, "fillColor", json!([0.0, 0.0, 1.0, 1.0]));
++    let cid = s.active_comp_id().unwrap();
++    for scale in [1.0, 0.5] {
++        let img = s.render(cid, Tick::ZERO, RenderOpts { scale, ..Default::default() });
++        assert_eq!(img.get((80.0 * scale) as i64, (50.0 * scale) as i64), [1.0, 0.0, 0.0, 1.0]);
++        // Solid starts at x=70; x=60 is outside the original framebuffer.
++        let p = img.get((60.0 * scale) as i64, (50.0 * scale) as i64);
++        assert!(p[2] > 0.99 && p[3] > 0.99, "scale={scale}, pixel={p:?}");
++    }
++    prop(&mut s, l, "offsetX", json!(-35));
++    let img = s.render(cid, Tick::ZERO, Default::default());
++    assert!(img.get(30, 50)[2] > 0.99);
++    assert_eq!(img.get(80, 50), [1.0, 0.0, 0.0, 1.0]);
++}
++#[test]
++fn textbox_follows_real_text_edits_and_empty_alpha() {
++    let mut s = effectcraft_host::session();
++    s.execute("comp.new", json!({"width":640,"height":360,"duration":2})).unwrap();
++    let l = s.execute("layer.newText", json!({"text":"I","size":40})).unwrap()["layer"].as_u64().unwrap();
++    s.execute("effect.apply", json!({"layer":l,"effect":"org.effectcraft.text-box"})).unwrap();
++    prop(&mut s, l, "fillColor", json!([0.0, 0.0, 1.0, 1.0]));
++    let cid = s.active_comp_id().unwrap();
++    let before = s.render(cid, Tick::ZERO, Default::default());
++    s.execute("layer.setText", json!({"layer":l,"text":"WIDE TEXT\nsecond line","size":60})).unwrap();
++    let after = s.render(cid, Tick::ZERO, Default::default());
++    let blue = |img: &effectcraft_raster::Image| img.data.iter().filter(|p| p[2] > 0.9 && p[0] < 0.1 && p[3] > 0.9).count();
++    assert!(blue(&after) > blue(&before) * 2);
++    s.execute("layer.setText", json!({"layer":l,"text":"   \n  "})).unwrap();
++    let blank = s.render(cid, Tick::ZERO, Default::default());
++    assert!(blank.data.iter().all(|p| p[3] == 0.0));
++}
++
++#[test]
++fn textbox_parameters_animate_and_survive_project_serialization() {
++    let mut s = effectcraft_host::session();
++    s.execute("comp.new", json!({"width":160,"height":100,"duration":2})).unwrap();
++    let l = s.execute("layer.newSolid", json!({"width":20,"height":10,"color":[1.0,0.0,0.0]})).unwrap()["layer"].as_u64().unwrap();
++    s.execute("effect.apply", json!({"layer":l,"effect":"TextBox"})).unwrap();
++    prop(&mut s, l, "fillColor", json!([0.0, 0.0, 1.0, 1.0]));
++    for (time, value) in [(0.0, 0.0), (1.0, 30.0)] {
++        s.execute("prop.addKey", json!({"layer":l,"path":"effects/#1/paddingX","time":time,"value":value})).unwrap();
++    }
++    let cid = s.active_comp_id().unwrap();
++    let a = s.render(cid, Tick::ZERO, Default::default());
++    let b = s.render(cid, Tick::from_seconds_f64(1.0), Default::default());
++    assert_eq!(a.get(50, 50)[3], 0.0);
++    assert!(b.get(50, 50)[2] > 0.99);
++    let bytes = serde_json::to_vec(&s.project).unwrap();
++    s.project = serde_json::from_slice(&bytes).unwrap();
++    let c = s.render(cid, Tick::from_seconds_f64(1.0), Default::default());
++    assert_eq!(b.data, c.data);
++    let plugins = s.execute("effect.plugins.list", json!({})).unwrap();
++    let p = plugins["plugins"].as_array().unwrap().iter().find(|p| p["id"] == "org.effectcraft.text-box").unwrap();
++    assert_eq!(p["params"].as_array().unwrap().len(), 14);
++}
++
++#[test]
++fn textbox_matte_negative_padding_animates_and_roundtrips_with_transparent_fill() {
++    let mut s = effectcraft_host::session();
++    s.execute("comp.new", json!({"width":160,"height":100,"duration":2})).unwrap();
++    let l = s.execute("layer.newSolid", json!({"width":40,"height":20,"color":[1.0,0.0,0.0]})).unwrap()["layer"].as_u64().unwrap();
++    s.execute("effect.apply", json!({"layer":l,"effect":"TextBox"})).unwrap();
++    prop(&mut s, l, "matte", json!(true));
++    prop(&mut s, l, "paddingY", json!(-4));
++    // Both the fill opacity and the color alpha may hide the background, never the text.
++    prop(&mut s, l, "fillColor", json!([0.0, 0.0, 1.0, 0.0]));
++    prop(&mut s, l, "fillOpacity", json!(0));
++    for (time, value) in [(0.0, -4.0), (1.0, -12.0)] {
++        s.execute("prop.addKey", json!({"layer":l,"path":"effects/#1/paddingX","time":time,"value":value})).unwrap();
++    }
++    let bytes = serde_json::to_vec(&s.project).unwrap();
++    let cid = s.active_comp_id().unwrap();
++    for scale in [1.0, 0.5] {
++        let opts = RenderOpts { scale, ..Default::default() };
++        let sample = |img: &effectcraft_raster::Image, x: f64, y: f64| img.get((x * scale) as i64, (y * scale) as i64);
++        let a = s.render(cid, Tick::ZERO, opts);
++        assert_eq!(sample(&a, 60.0, 50.0), [0.0; 4]);
++        assert_eq!(sample(&a, 68.0, 50.0), [1.0, 0.0, 0.0, 1.0]);
++        let b = s.render(cid, Tick::from_seconds_f64(1.0), opts);
++        assert_eq!(sample(&b, 68.0, 50.0), [0.0; 4]);
++        assert_eq!(sample(&b, 80.0, 50.0), [1.0, 0.0, 0.0, 1.0]);
++        s.project = serde_json::from_slice(&bytes).unwrap();
++        let restored = s.render(cid, Tick::from_seconds_f64(1.0), opts);
++        assert_eq!(restored.data, b.data);
++    }
++}
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 49f9da4..e9ba270 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -32,6 +32,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
+ | L2 | `pdf` | PDF, PDF-compatible Illustrator (`.ai`) and EPS (PostScript subset) vector footage into the `svg` render tree: paths, fills, strokes, shadings, tiling patterns, clipping, text (embedded TrueType / CFF / Type 1 / Type 3 fonts; the bundled `text` fonts for the standard 14), images, blend modes, soft masks, optional-content layers |
+ | L2 | `model` | 3D models for Advanced 3D: glTF 2.0 (`.gltf`/`.glb`) and OBJ/MTL import (meshes, PBR metallic-roughness materials and textures, node hierarchy, skins, animations), parametric primitives, extruded/bevelled outline meshes and polygon triangulation |
+ | L2 | `track` | Motion tracking: feature/search region point tracking (pyramid normalized cross-correlation, Lucas–Kanade sub-pixel refinement), confidence, homography/affine/similarity solves |
++| L3 | `text-box` (examples/plugins) | Linked Rust pixel-effect plug-in: alpha-driven expandable text background |
+ | L3 | `render` | Evaluation and compositing: sources, masks, effects, transforms, 3D, motion blur, mattes, blending, layer cache, audio mixdown |
+ | L3 | `media` | Footage decoding (FilmCraft's pure-Rust codecs), image sequences, Photoshop and SVG stills, frame cache |
+ | L3 | `expr` | The expression engine (JavaScript via boa) with the After Effects object model |
+diff --git a/docs/plugins.md b/docs/plugins.md
+index 47ce5ca..7a555b3 100644
+--- a/docs/plugins.md
++++ b/docs/plugins.md
+@@ -126,3 +126,23 @@ effects can be registered per process.
+ The API version is checked when a plug-in loads: a manifest or module for another version is
+ refused with a message. Within a version the contract above does not change; additions (new
+ parameter types, new optional exports) bump the version.
++
++## Rust buffer-rendering host extension
++
++The WebAssembly v1 ABI and manifests remain unchanged. The Rust `EffectPlugin` trait additionally
++provides `render_buffer(&Buf, &PluginParams, time) -> Result<Buf, String>`. Its default adapter
++clones the input and calls the existing in-place `render`, so existing Rust and WASM plug-ins
++continue to work. Override this hook to return a larger framebuffer. Keep `scale` unchanged and
++adjust `offset` so a layer point still maps to `point * scale + offset`. The host validates the
++returned dimensions, scale and offset and retains the original input on error.
++
++This is a **linked Rust host extension**, not a new WebAssembly export. A v1 `.wasm` still cannot
++resize its input. Linked effects appear in the same menus, use the same property/keyframe system,
++and run on the CPU when a GPU compositor is selected.
++
++[`examples/plugins/text-box`](../examples/plugins/text-box) implements TextBox through this hook.
++The standard host links and registers it for desktop, CLI and web sessions. It computes actual
++positive-alpha bounds after upstream effects/masks, draws a rounded fill and centered stroke behind
++the input, and expands the framebuffer as needed. The renderer already propagates `Buf.offset`
++and the expanded dimensions through placement; it does not clip to the original source rectangle.
++The final composition/ROI, downstream mattes and adjustment-layer footprints still limit output.
+diff --git a/examples/plugins/text-box/Cargo.toml b/examples/plugins/text-box/Cargo.toml
+new file mode 100644
+index 0000000..010d6be
+--- /dev/null
++++ b/examples/plugins/text-box/Cargo.toml
+@@ -0,0 +1,15 @@
++[package]
++name = "effectcraft-text-box"
++version = "1.1.0"
++edition.workspace = true
++license.workspace = true
++rust-version.workspace = true
++publish = false
++
++[lints]
++workspace = true
++
++[dependencies]
++effectcraft-effects.workspace = true
++serde_json.workspace = true
++rayon.workspace = true
+diff --git a/examples/plugins/text-box/README.md b/examples/plugins/text-box/README.md
+new file mode 100644
+index 0000000..e278477
+--- /dev/null
++++ b/examples/plugins/text-box/README.md
+@@ -0,0 +1,50 @@
++# TextBox
++
++A linked Rust pixel effect for EffectCraft, id `org.effectcraft.text-box`, category **Text**.
++Apply to a text layer using Effect → Text → TextBox or find TextBox in Effects & Presets.
++No additional layers are created. The standard host registers the plugin at session startup.
++
++Parameters are ordinary animatable effect properties: Padding X/Y, Fill Color/Opacity,
++Corner Radius, Offset X/Y, Padding Left/Right/Top/Bottom, Stroke Width/Color, Matte.
++Side padding **adds** to X/Y padding; set X/Y to zero for fully independent sides.
++All six padding controls accept negative values (down to -10000 px), so the box can be
++smaller than its source. If either dimension reaches zero, the box disappears instead of
++flipping inside out.
++Stroke is centered on the rectangle edge. Radius clamps to half the shorter rectangle edge.
++All distances are layer pixels and are scaled for preview resolution.
++
++**Matte** (off by default for compatibility) clips the source to the rounded rectangle's
++interior. It follows padding, offset and corner radius, with antialiased edges. Its coverage
++is independent of Fill Opacity, Fill Color alpha and Stroke Color alpha: set Fill Opacity
++to zero for a completely invisible clipping box. Stroke Width does not enlarge the matte.
++With Matte on, a collapsed box hides the source too. Layer Transform Opacity still controls
++the combined text and box normally; use Fill Opacity to fade only the background.
++
++Bounds come from finite alpha > 0, including antialiased pixels. Multiline text is measured
++as one box. Leading/trailing spaces and blank lines do not enlarge it unless they change
++placement of visible glyphs. Fully transparent input produces no box. The source remains
++above the box; with Matte off, it stays visible even when offsets move the box away from it. Upstream masks/effects affect
++bounds; downstream effects process both text and box. Use TextBox before glow/shadow effects
++if the box should follow glyphs rather than their glow/shadow.
++
++The plugin scans input once, then renders output rows in parallel. It stores no mutable render
++state and works on concurrent frames. No independent bounds cache: the existing renderer caches
++processed layer buffers. A separate cache without a trusted input revision would require a full
++pixel hash and would not eliminate the O(N) input pass. Output has a 16M-pixel (256 MiB) allocation
++limit; excessive geometry returns an error, logged by the host, retaining the unmodified frame.
++This is an explicit failure, never silent clipping.
++
++## Build and test
++
++From the repository root:
++
++```sh
++cargo test -p effectcraft-text-box
++cargo test -p effectcraft-host --test text_box --test plugins
++cargo run --release -p effectcraft
++```
++
++This is a source-linked plugin, not a `.wasm`/DLL to load via Load Effect Plug-in. WASM v1 cannot
++resize a framebuffer. `render_buffer` is a general Rust plugin host extension; no text-specific
++logic was added to the renderer or text-layer implementation. Its default adapter preserves
++existing in-place plugins and restores the original frame when they fail.
+diff --git a/examples/plugins/text-box/manifest.json b/examples/plugins/text-box/manifest.json
+new file mode 100644
+index 0000000..d2c4a7b
+--- /dev/null
++++ b/examples/plugins/text-box/manifest.json
+@@ -0,0 +1,144 @@
++{
++  "api": 1,
++  "id": "org.effectcraft.text-box",
++  "name": "TextBox",
++  "category": "Text",
++  "version": "1.1.0",
++  "author": "EffectCraft contributors",
++  "description": "Alpha-following rounded background with signed padding and an optional geometric text matte independent of fill opacity. Side padding adds to X/Y padding. Stroke is centered.",
++  "params": [
++    {
++      "id": "paddingX",
++      "name": "Padding X",
++      "type": "slider",
++      "default": 20,
++      "min": -10000,
++      "max": 10000,
++      "sliderMax": 200,
++      "sliderMin": -200
++    },
++    {
++      "id": "paddingY",
++      "name": "Padding Y",
++      "type": "slider",
++      "default": 10,
++      "min": -10000,
++      "max": 10000,
++      "sliderMax": 200,
++      "sliderMin": -200
++    },
++    {
++      "id": "fillColor",
++      "name": "Fill Color",
++      "type": "color",
++      "default": [
++        0,
++        0,
++        0,
++        1
++      ]
++    },
++    {
++      "id": "fillOpacity",
++      "name": "Fill Opacity",
++      "type": "slider",
++      "default": 100,
++      "min": 0,
++      "max": 100,
++      "sliderMax": 100
++    },
++    {
++      "id": "cornerRadius",
++      "name": "Corner Radius",
++      "type": "slider",
++      "default": 0,
++      "min": 0,
++      "max": 10000,
++      "sliderMax": 200
++    },
++    {
++      "id": "offsetX",
++      "name": "Offset X",
++      "type": "slider",
++      "default": 0,
++      "min": -10000,
++      "max": 10000,
++      "sliderMax": 200
++    },
++    {
++      "id": "offsetY",
++      "name": "Offset Y",
++      "type": "slider",
++      "default": 0,
++      "min": -10000,
++      "max": 10000,
++      "sliderMax": 200
++    },
++    {
++      "id": "paddingLeft",
++      "name": "Padding Left",
++      "type": "slider",
++      "default": 0,
++      "min": -10000,
++      "max": 10000,
++      "sliderMax": 200,
++      "sliderMin": -200
++    },
++    {
++      "id": "paddingRight",
++      "name": "Padding Right",
++      "type": "slider",
++      "default": 0,
++      "min": -10000,
++      "max": 10000,
++      "sliderMax": 200,
++      "sliderMin": -200
++    },
++    {
++      "id": "paddingTop",
++      "name": "Padding Top",
++      "type": "slider",
++      "default": 0,
++      "min": -10000,
++      "max": 10000,
++      "sliderMax": 200,
++      "sliderMin": -200
++    },
++    {
++      "id": "paddingBottom",
++      "name": "Padding Bottom",
++      "type": "slider",
++      "default": 0,
++      "min": -10000,
++      "max": 10000,
++      "sliderMax": 200,
++      "sliderMin": -200
++    },
++    {
++      "id": "strokeWidth",
++      "name": "Stroke Width",
++      "type": "slider",
++      "default": 0,
++      "min": 0,
++      "max": 10000,
++      "sliderMax": 200
++    },
++    {
++      "id": "strokeColor",
++      "name": "Stroke Color",
++      "type": "color",
++      "default": [
++        1,
++        1,
++        1,
++        1
++      ]
++    },
++    {
++      "id": "matte",
++      "name": "Matte",
++      "type": "checkbox",
++      "default": false
++    }
++  ]
++}
+diff --git a/examples/plugins/text-box/src/lib.rs b/examples/plugins/text-box/src/lib.rs
+new file mode 100644
+index 0000000..f2b5934
+--- /dev/null
++++ b/examples/plugins/text-box/src/lib.rs
+@@ -0,0 +1,186 @@
++//! TextBox is a linked Rust effect plug-in; no text-layer-specific rendering.
++#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
++
++use effectcraft_effects::plugin::{EffectPlugin, PluginFrame, PluginManifest, PluginParams, register_plugin};
++use effectcraft_effects::{Buf, Image};
++use rayon::prelude::*;
++use std::sync::{Arc, OnceLock};
++
++pub const ID: &str = "org.effectcraft.text-box";
++const MAX_PIXELS: usize = 16_777_216; // 256 MiB of RGBA f32, checked before allocation.
++const MANIFEST: &str = include_str!("../manifest.json");
++
++pub struct TextBox(PluginManifest);
++impl TextBox {
++    pub fn new() -> Result<Self, String> {
++        let manifest: PluginManifest = serde_json::from_str(MANIFEST).map_err(|e| e.to_string())?;
++        manifest.validate()?;
++        Ok(Self(manifest))
++    }
++}
++
++pub fn register() -> Result<(), String> {
++    static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
++    REGISTERED.get_or_init(|| register_plugin(Arc::new(TextBox::new()?)).map(|_| ())).clone()
++}
++
++/// Half-open pixel-edge bounds; any finite positive alpha counts, including antialiasing.
++/// Blank lines and spaces have no pixels and therefore do not enlarge these bounds.
++pub fn alpha_bounds(img: &Image) -> Option<[f64; 4]> {
++    if img.width == 0 || img.height == 0 || (img.width as usize).checked_mul(img.height as usize) != Some(img.data.len()) {
++        return None;
++    }
++    let w = img.width as usize;
++    let mut bounds = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
++    for (i, px) in img.data.iter().enumerate() {
++        if px[3].is_finite() && px[3] > 0.0 {
++            let (x, y) = ((i % w) as f64, (i / w) as f64);
++            bounds[0] = bounds[0].min(x);
++            bounds[1] = bounds[1].min(y);
++            bounds[2] = bounds[2].max(x + 1.0);
++            bounds[3] = bounds[3].max(y + 1.0);
++        }
++    }
++    bounds[0].is_finite().then_some(bounds)
++}
++
++fn scalar(params: &PluginParams, id: &str, min: f64, max: f64) -> Result<f64, String> {
++    let v = params.f(id);
++    if !v.is_finite() {
++        return Err(format!("non-finite TextBox parameter: {id}"));
++    }
++    Ok(v.clamp(min, max))
++}
++
++fn color(params: &PluginParams, id: &str) -> Result<[f64; 4], String> {
++    let c = params.color(id);
++    if c.iter().any(|v| !v.is_finite()) {
++        return Err(format!("non-finite TextBox color: {id}"));
++    }
++    Ok(c.map(|v| v.clamp(0.0, 1.0)))
++}
++
++/// Signed distance to a rounded rectangle, with radius clamped to half its shorter edge.
++fn distance(x: f64, y: f64, rect: [f64; 4], radius: f64) -> f64 {
++    let hx = (rect[2] - rect[0]) * 0.5;
++    let hy = (rect[3] - rect[1]) * 0.5;
++    let r = radius.min(hx.min(hy)).max(0.0);
++    let qx = (x - (rect[0] + hx)).abs() - hx + r;
++    let qy = (y - (rect[1] + hy)).abs() - hy + r;
++    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
++}
++
++fn over(front: [f32; 4], back: [f32; 4]) -> [f32; 4] {
++    let k = 1.0 - front[3].clamp(0.0, 1.0);
++    std::array::from_fn(|i| front[i] + back[i] * k)
++}
++fn premult(c: [f64; 4], coverage: f64) -> [f32; 4] {
++    let a = (c[3] * coverage) as f32;
++    [c[0] as f32 * a, c[1] as f32 * a, c[2] as f32 * a, a]
++}
++
++impl EffectPlugin for TextBox {
++    fn manifest(&self) -> &PluginManifest {
++        &self.0
++    }
++    fn source(&self) -> String {
++        "linked Rust plug-in: examples/plugins/text-box".into()
++    }
++    fn render(&self, _frame: &mut PluginFrame, _params: &PluginParams, _time: f64) -> Result<(), String> {
++        Err("TextBox requires the Rust render_buffer host extension".into())
++    }
++    fn render_buffer(&self, input: &Buf, params: &PluginParams, _time: f64) -> Result<Buf, String> {
++        let count = (input.img.width as usize).checked_mul(input.img.height as usize);
++        if count != Some(input.img.data.len()) || input.img.data.len() > MAX_PIXELS {
++            return Err("invalid or oversized TextBox input buffer".into());
++        }
++        let s = input.scale;
++        if !s.is_finite() || s <= 0.0 || input.offset.iter().any(|v| !v.is_finite()) {
++            return Err("invalid TextBox input coordinates".into());
++        }
++        let Some(b) = alpha_bounds(&input.img) else {
++            return Ok(input.clone());
++        };
++        let px = scalar(params, "paddingX", -10000.0, 10000.0)?;
++        let py = scalar(params, "paddingY", -10000.0, 10000.0)?;
++        let sides = ["paddingLeft", "paddingTop", "paddingRight", "paddingBottom"].map(|id| scalar(params, id, -10000.0, 10000.0));
++        let [left, top, right, bottom] = sides;
++        let (left, top, right, bottom) = (left?, top?, right?, bottom?);
++        let ox = scalar(params, "offsetX", -10000.0, 10000.0)? * s;
++        let oy = scalar(params, "offsetY", -10000.0, 10000.0)? * s;
++        let rect = [b[0] - (px + left) * s + ox, b[1] - (py + top) * s + oy, b[2] + (px + right) * s + ox, b[3] + (py + bottom) * s + oy];
++        let radius = scalar(params, "cornerRadius", 0.0, 10000.0)? * s;
++        let stroke_width = scalar(params, "strokeWidth", 0.0, 10000.0)? * s;
++        let mut fill = color(params, "fillColor")?;
++        fill[3] *= scalar(params, "fillOpacity", 0.0, 100.0)? / 100.0;
++        let stroke = color(params, "strokeColor")?;
++        let matte = scalar(params, "matte", 0.0, 1.0)? != 0.0;
++        if rect.iter().chain([radius, stroke_width].iter()).any(|v| !v.is_finite()) {
++            return Err("TextBox geometry is not finite".into());
++        }
++        // Negative padding can collapse either axis. An empty shape has no fill, stroke
++        // or matte coverage; never let the SDF turn crossed edges into an inverted box.
++        if rect[2] <= rect[0] || rect[3] <= rect[1] {
++            let mut out = input.clone();
++            if matte {
++                out.img.data.fill([0.0; 4]);
++            }
++            return Ok(out);
++        }
++        if !matte && fill[3] == 0.0 && (stroke_width == 0.0 || stroke[3] == 0.0) {
++            return Ok(input.clone());
++        }
++        let margin = stroke_width * 0.5 + 0.5;
++        let x0 = (rect[0] - margin).floor().min(0.0);
++        let y0 = (rect[1] - margin).floor().min(0.0);
++        let x1 = (rect[2] + margin).ceil().max(input.img.width as f64);
++        let y1 = (rect[3] + margin).ceil().max(input.img.height as f64);
++        let wf = x1 - x0;
++        let hf = y1 - y0;
++        if [x0, y0, x1, y1, wf, hf, radius, stroke_width].iter().any(|v| !v.is_finite())
++            || wf < 1.0
++            || hf < 1.0
++            || wf > MAX_PIXELS as f64
++            || hf > MAX_PIXELS as f64
++        {
++            return Err("TextBox geometry exceeds supported buffer size".into());
++        }
++        let (w, h) = (wf as usize, hf as usize);
++        let n = w.checked_mul(h).filter(|n| *n <= MAX_PIXELS).ok_or("TextBox output exceeds 16M pixels (256 MiB)")?;
++        let mut data = Vec::new();
++        data.try_reserve_exact(n).map_err(|e| format!("TextBox allocation failed: {e}"))?;
++        data.resize(n, [0.0; 4]);
++        let iw = input.img.width as usize;
++        let ih = input.img.height as usize;
++        data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
++            let sy = y as i64 + y0 as i64;
++            for (x, out) in row.iter_mut().enumerate() {
++                let sx = x as i64 + x0 as i64;
++                let src = if sx >= 0 && sy >= 0 && (sx as usize) < iw && (sy as usize) < ih {
++                    input.img.data.get((sy as usize).saturating_mul(iw).saturating_add(sx as usize)).copied().unwrap_or([0.0; 4])
++                } else {
++                    [0.0; 4]
++                };
++                let (cx, cy) = (sx as f64 + 0.5, sy as f64 + 0.5);
++                // Avoid distance/coverage/compositing work outside the box's footprint.
++                if cx < rect[0] - margin || cx > rect[2] + margin || cy < rect[1] - margin || cy > rect[3] + margin {
++                    *out = if matte { [0.0; 4] } else { src };
++                    continue;
++                }
++                let d = distance(cx, cy, rect, radius);
++                // The matte is geometric coverage, independent of fill/stroke alpha.
++                // Apply it to every premultiplied source channel to preserve edge colors.
++                let coverage = (0.5 - d).clamp(0.0, 1.0);
++                let src = if matte { src.map(|v| v * coverage as f32) } else { src };
++                let bg = premult(fill, coverage);
++                let line = if stroke_width > 0.0 { (0.5 + stroke_width * 0.5 - d.abs()).clamp(0.0, 1.0) } else { 0.0 };
++                let bg = over(premult(stroke, line), bg);
++                *out = over(src, bg);
++            }
++        });
++        Ok(Buf { img: Image { width: w as u32, height: h as u32, data }, offset: [input.offset[0] - x0, input.offset[1] - y0], scale: s })
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/examples/plugins/text-box/src/tests.rs b/examples/plugins/text-box/src/tests.rs
+new file mode 100644
+index 0000000..9641e0e
+--- /dev/null
++++ b/examples/plugins/text-box/src/tests.rs
+@@ -0,0 +1,293 @@
++use super::*;
++use effectcraft_effects::{EffectCtx, Params};
++
++fn input() -> Buf {
++    let mut img = Image::new(4, 3);
++    img.set(0, 0, [0.5, 0.0, 0.0, 0.5]);
++    img.set(3, 2, [0.0, 1.0, 0.0, 1.0]);
++    Buf { img, offset: [2.0, -3.0], scale: 1.0 }
++}
++fn try_run(input: &Buf, changes: &[(&str, f64)]) -> Result<Buf, String> {
++    let plugin = TextBox::new().unwrap();
++    let m = plugin.manifest();
++    let mut flat = Vec::new();
++    for p in &m.params {
++        use effectcraft_effects::plugin::PluginParamKind;
++        match p.kind {
++            PluginParamKind::Slider { default, .. } => flat.push(changes.iter().find(|(id, _)| *id == p.id).map(|(_, v)| *v).unwrap_or(default)),
++            PluginParamKind::Color { default } => flat.extend(default),
++            PluginParamKind::Checkbox { default } => {
++                flat.push(changes.iter().find(|(id, _)| *id == p.id).map(|(_, v)| *v).unwrap_or(if default { 1.0 } else { 0.0 }))
++            }
++            _ => return Err("unsupported test manifest parameter".into()),
++        }
++    }
++    plugin.render_buffer(input, &PluginParams { manifest: m, flat: &flat }, 0.0)
++}
++fn run(input: &Buf, changes: &[(&str, f64)]) -> Buf {
++    try_run(input, changes).unwrap()
++}
++
++fn plate_input() -> Buf {
++    let mut img = Image::new(12, 8);
++    img.data.fill([0.5, 0.0, 0.0, 0.5]);
++    Buf { img, offset: [0.0; 2], scale: 1.0 }
++}
++
++#[test]
++fn signed_padding_shrinks_the_background_without_clipping_source_by_default() {
++    let mut b = plate_input();
++    b.img.data.fill([0.0; 4]);
++    b.img.set(0, 0, [1.0; 4]);
++    b.img.set(11, 7, [1.0; 4]);
++    let out = run(&b, &[("paddingX", -2.0), ("paddingY", -1.0)]);
++    assert_eq!(layer_pixel(&out, 1.0, 3.0), [0.0; 4]);
++    assert_eq!(layer_pixel(&out, 2.0, 3.0), [0.0, 0.0, 0.0, 1.0]);
++    assert_eq!(layer_pixel(&out, 10.0, 3.0), [0.0; 4]);
++    assert_eq!(layer_pixel(&out, 0.0, 0.0), [1.0; 4]);
++}
++
++#[test]
++fn matte_clips_source_even_when_fill_is_invisible() {
++    let b = plate_input();
++    for opacity in [0.0, 25.0, 100.0] {
++        let out = run(&b, &[("paddingX", -2.0), ("paddingY", -1.0), ("matte", 1.0), ("fillOpacity", opacity)]);
++        assert_eq!(layer_pixel(&out, 0.0, 3.0), [0.0; 4]);
++        let inside = layer_pixel(&out, 3.0, 3.0);
++        assert_eq!(inside[0], 0.5, "text brightness must not depend on fill opacity");
++        if opacity == 0.0 {
++            assert_eq!(inside, [0.5, 0.0, 0.0, 0.5]);
++        }
++    }
++}
++
++#[test]
++fn matte_respects_signed_side_padding_and_offset() {
++    let b = plate_input();
++    let out = run(
++        &b,
++        &[
++            ("paddingX", 0.0),
++            ("paddingY", 0.0),
++            ("paddingLeft", -3.0),
++            ("paddingRight", -2.0),
++            ("paddingTop", -2.0),
++            ("paddingBottom", -1.0),
++            ("offsetX", 1.0),
++            ("matte", 1.0),
++            ("fillOpacity", 0.0),
++        ],
++    );
++    for (x, y) in [(3.0, 3.0), (11.0, 3.0), (5.0, 1.0), (5.0, 7.0)] {
++        assert_eq!(layer_pixel(&out, x, y), [0.0; 4]);
++    }
++    assert_eq!(layer_pixel(&out, 4.0, 2.0), [0.5, 0.0, 0.0, 0.5]);
++}
++
++#[test]
++fn rounded_matte_multiplies_premultiplied_channels_and_moves_without_text() {
++    let b = plate_input();
++    let out = run(&b, &[("paddingX", 0.0), ("paddingY", 0.0), ("cornerRadius", 4.0), ("matte", 1.0), ("fillOpacity", 0.0)]);
++    assert_eq!(layer_pixel(&out, 0.0, 0.0), [0.0; 4]);
++    let edge = layer_pixel(&out, 1.0, 1.0);
++    assert!(edge[3] > 0.0 && edge[3] < 0.5);
++    assert_eq!(edge[0], edge[3]);
++    assert_eq!(layer_pixel(&out, 6.0, 4.0), [0.5, 0.0, 0.0, 0.5]);
++    let moved = run(&b, &[("paddingX", 0.0), ("paddingY", 0.0), ("offsetX", 20.0), ("matte", 1.0), ("fillOpacity", 0.0)]);
++    assert!(moved.img.data.iter().all(|p| *p == [0.0; 4]));
++}
++
++#[test]
++fn collapsed_rectangle_is_empty_instead_of_inverted_or_outlined() {
++    let b = plate_input();
++    for shrink in [-6.0, -100.0] {
++        let out = run(&b, &[("paddingX", shrink), ("paddingY", 0.0), ("matte", 1.0), ("strokeWidth", 5.0)]);
++        assert!(out.img.data.iter().all(|p| *p == [0.0; 4]));
++        let off = run(&b, &[("paddingX", shrink), ("paddingY", 0.0), ("strokeWidth", 5.0)]);
++        assert_eq!(off.img, b.img);
++        assert_eq!(off.offset, b.offset);
++    }
++}
++
++#[test]
++fn matte_padding_tracks_preview_scale() {
++    let mut b = plate_input();
++    b.scale = 0.5;
++    let out = run(&b, &[("paddingX", -4.0), ("paddingY", -2.0), ("matte", 1.0), ("fillOpacity", 0.0)]);
++    assert_eq!(layer_pixel(&out, 2.0, 6.0), [0.0; 4]);
++    assert_eq!(layer_pixel(&out, 4.0, 6.0), [0.5, 0.0, 0.0, 0.5]);
++}
++
++#[test]
++fn padding_controls_accept_negative_values() {
++    let plugin = TextBox::new().unwrap();
++    for id in ["paddingX", "paddingY", "paddingLeft", "paddingRight", "paddingTop", "paddingBottom"] {
++        let p = plugin.manifest().params.iter().find(|p| p.id == id).unwrap();
++        let effectcraft_effects::plugin::PluginParamKind::Slider { min, slider_min, .. } = p.kind else { panic!("slider") };
++        assert!(min <= -10000.0 && slider_min.unwrap_or(min) < 0.0, "{id}");
++    }
++}
++fn layer_pixel(b: &Buf, x: f64, y: f64) -> [f32; 4] {
++    b.img.get((x * b.scale + b.offset[0]) as i64, (y * b.scale + b.offset[1]) as i64)
++}
++#[test]
++fn bounds_include_antialias_and_multiline_gaps() {
++    let mut b = input();
++    b.img.set(0, 0, [0.0, 0.0, 0.0, 1e-7]);
++    assert_eq!(alpha_bounds(&b.img), Some([0.0, 0.0, 4.0, 3.0]));
++    b.img.data.fill([0.0; 4]);
++    assert_eq!(alpha_bounds(&b.img), None);
++    assert_eq!(alpha_bounds(&Image::default()), None);
++    b.img.set(1, 1, [0.0, 0.0, 0.0, f32::NAN]);
++    assert_eq!(alpha_bounds(&b.img), None);
++}
++#[test]
++fn padding_expands_all_sides_and_preserves_text_coordinates() {
++    let b = input();
++    let out = run(&b, &[("paddingX", 2.0), ("paddingY", 2.0)]);
++    assert!(out.img.width > b.img.width && out.img.height > b.img.height);
++    assert_eq!(layer_pixel(&out, -3.0, 2.0), [0.0, 0.0, 0.0, 1.0]);
++    // Original half-alpha red over black, not replaced by the box.
++    assert_eq!(layer_pixel(&out, -2.0, 3.0), [0.5, 0.0, 0.0, 1.0]);
++    assert_eq!(layer_pixel(&out, 1.0, 5.0), [0.0, 1.0, 0.0, 1.0]);
++}
++#[test]
++fn offset_both_directions_never_moves_original_text() {
++    let b = input();
++    for ox in [-12.0, 12.0] {
++        let out = run(&b, &[("paddingX", 0.0), ("paddingY", 0.0), ("offsetX", ox), ("offsetY", ox)]);
++        assert_eq!(layer_pixel(&out, -2.0, 3.0), [0.5, 0.0, 0.0, 0.5]);
++        assert_eq!(layer_pixel(&out, -1.0 + ox, 4.0 + ox), [0.0, 0.0, 0.0, 1.0]);
++    }
++}
++#[test]
++fn blank_input_stays_blank() {
++    let mut b = input();
++    b.img.data.fill([0.0; 4]);
++    let out = run(&b, &[]);
++    assert_eq!(out.img, b.img);
++    assert_eq!(out.offset, b.offset);
++}
++#[test]
++fn preview_scale_and_asymmetric_padding() {
++    let mut b = input();
++    b.scale = 0.5;
++    let out = run(&b, &[("paddingX", 0.0), ("paddingY", 0.0), ("paddingLeft", 8.0)]);
++    assert_eq!(out.offset[0] - b.offset[0], 5.0); // four pixels plus antialias guard
++    assert_eq!(out.offset[1] - b.offset[1], 1.0);
++}
++#[test]
++fn radius_stroke_and_fill_opacity() {
++    let b = input();
++    let out = run(&b, &[("paddingX", 4.0), ("paddingY", 4.0), ("cornerRadius", 4.0), ("fillOpacity", 50.0)]);
++    assert_eq!(layer_pixel(&out, -3.0, 4.0), [0.0, 0.0, 0.0, 0.5]);
++    assert!(layer_pixel(&out, -6.0, -1.0)[3] < 0.1);
++    let line = run(&b, &[("paddingX", 2.0), ("paddingY", 2.0), ("strokeWidth", 2.0), ("fillOpacity", 0.0)]);
++    assert_eq!(layer_pixel(&line, -4.0, 4.0), [1.0; 4]);
++}
++#[test]
++fn oversized_and_nonfinite_geometry_returns_error() {
++    assert!(try_run(&input(), &[("paddingX", 10000.0), ("paddingY", 10000.0)]).is_err());
++    assert!(try_run(&input(), &[("offsetX", f64::NAN)]).is_err());
++    let p = TextBox::new().unwrap();
++    let mut b = input();
++    b.scale = f64::INFINITY;
++    assert!(p.render_buffer(&b, &PluginParams { manifest: p.manifest(), flat: &[] }, 0.0).is_err());
++    b.scale = 1.0;
++    b.img.width = u32::MAX;
++    assert!(p.render_buffer(&b, &PluginParams { manifest: p.manifest(), flat: &[] }, 0.0).is_err());
++}
++#[test]
++fn trampoline_dispatches_expanding_plugin() {
++    register().unwrap();
++    let spec = effectcraft_effects::find(ID).unwrap();
++    let mut params = Params::default();
++    for p in &spec.params {
++        params.values.insert(p.id.into(), p.default.clone());
++    }
++    let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [4.0, 3.0], seed: 0, adjustment: false, env: Default::default() };
++    let out = effectcraft_effects::apply(spec, &ctx, input());
++    assert!(out.img.width > 4 && out.img.height > 3);
++}
++
++struct Failure(PluginManifest);
++impl EffectPlugin for Failure {
++    fn manifest(&self) -> &PluginManifest {
++        &self.0
++    }
++    fn render(&self, frame: &mut PluginFrame, _params: &PluginParams, _time: f64) -> Result<(), String> {
++        frame.pixels.fill([1.0; 4]);
++        Err("synthetic failure after mutation".into())
++    }
++}
++#[test]
++fn existing_in_place_api_restores_input_on_error() {
++    let mut manifest = TextBox::new().unwrap().0;
++    manifest.id = "org.test.textbox-rollback".into();
++    let spec = register_plugin(Arc::new(Failure(manifest))).unwrap();
++    let b = input();
++    let params = Params::default();
++    let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [4.0, 3.0], seed: 0, adjustment: false, env: Default::default() };
++    let out = effectcraft_effects::apply(spec, &ctx, b.clone());
++    assert_eq!(out.img, b.img);
++    assert_eq!(out.offset, b.offset);
++}
++
++/// Manual microbenchmark: excludes source rasterization and UI/GPU transfer.
++#[test]
++#[ignore = "manual performance measurement"]
++fn benchmark_large_transparent_input() {
++    for (w, h) in [(1920, 1080), (3840, 2160)] {
++        let mut img = Image::new(w, h);
++        for y in h / 2..h / 2 + 60 {
++            for x in w / 2..w / 2 + 300 {
++                img.set(x, y, [1.0; 4]);
++            }
++        }
++        let b = Buf { img, offset: [0.0; 2], scale: 1.0 };
++        let _ = run(&b, &[]); // warm rayon pool
++        let start = std::time::Instant::now();
++        for _ in 0..5 {
++            std::hint::black_box(run(&b, &[]));
++        }
++        eprintln!("TextBox {w}x{h}: {:.2} ms/frame (5 frames, CPU only)", start.elapsed().as_secs_f64() * 200.0);
++    }
++}
++
++struct InvalidBuffer {
++    m: PluginManifest,
++    kind: u8,
++}
++impl EffectPlugin for InvalidBuffer {
++    fn manifest(&self) -> &PluginManifest {
++        &self.m
++    }
++    fn render(&self, _frame: &mut PluginFrame, _params: &PluginParams, _time: f64) -> Result<(), String> {
++        Ok(())
++    }
++    fn render_buffer(&self, input: &Buf, _params: &PluginParams, _time: f64) -> Result<Buf, String> {
++        let mut out = input.clone();
++        match self.kind {
++            0 => out.img.width += 1,
++            1 => out.offset[0] = f64::NAN,
++            2 => out.scale *= 2.0,
++            _ => out.scale = f64::NAN,
++        }
++        Ok(out)
++    }
++}
++#[test]
++fn host_rejects_invalid_buffer_geometry_without_losing_source() {
++    for kind in 0..4 {
++        let mut m = TextBox::new().unwrap().0;
++        m.id = format!("org.test.textbox-invalid-{kind}");
++        let spec = register_plugin(Arc::new(InvalidBuffer { m, kind })).unwrap();
++        let b = input();
++        let params = Params::default();
++        let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [4.0, 3.0], seed: 0, adjustment: false, env: Default::default() };
++        let out = effectcraft_effects::apply(spec, &ctx, b.clone());
++        assert_eq!(out.img, b.img);
++        assert_eq!(out.offset, b.offset);
++        assert_eq!(out.scale, b.scale);
++    }
++}
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 051f6ec..cb96eb2 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -48,6 +48,7 @@ const LAYERS: &[(&str, u8)] = &[
+     ("lottie", 3),
+     ("format", 3),
+     ("plugin", 3),
++    ("text-box", 3),
+     ("interchange", 3),
+     ("engine", 4),
+     ("script", 4),

@@ -1,0 +1,44 @@
+diff --git a/crates/ui-egui/src/header.rs b/crates/ui-egui/src/header.rs
+index 214d271..ce67d5a 100644
+--- a/crates/ui-egui/src/header.rs
++++ b/crates/ui-egui/src/header.rs
+@@ -301,25 +301,7 @@ pub fn color_popup(ui: &mut egui::Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f3
+     changed
+ }
+ 
+-/// The ArtCraft mark as supplied in `docs/brand` (the README's and getartcraft.com's logo; used
+-/// unmodified, see `docs/brand/LICENSE-brand.txt`).
+-static ARTCRAFT_MARK: &[u8] = include_bytes!("../../../docs/brand/artcraft-mark.png");
+-
+-/// The ArtCraft mark in `r` (decoded once into a mipmapped texture, so it stays crisp from the
+-/// 24 px Tools bar to the About dialog). Nothing is drawn if it can't be decoded.
++/// Plain initials for this custom build; the upstream trademark is not bundled.
+ pub fn paint_logo(p: &egui::Painter, r: Rect) {
+-    let ctx = p.ctx();
+-    let id = egui::Id::new("artcraft-mark");
+-    let tex = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)).unwrap_or_else(|| {
+-        let tex = image::load_from_memory_with_format(ARTCRAFT_MARK, image::ImageFormat::Png).ok().map(|img| {
+-            let img = img.to_rgba8();
+-            let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+-            ctx.load_texture("artcraft-mark", ci, egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)))
+-        });
+-        ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+-        tex
+-    });
+-    if let Some(t) = tex {
+-        p.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+-    }
++    p.text(r.center(), Align2::CENTER_CENTER, "EC", Tokens::semibold(r.height() * 0.5), Color32::WHITE);
+ }
+diff --git a/crates/ui-egui/src/panels/dialogs.rs b/crates/ui-egui/src/panels/dialogs.rs
+--- a/crates/ui-egui/src/panels/dialogs.rs
++++ b/crates/ui-egui/src/panels/dialogs.rs
+@@ -211,7 +211,7 @@
+             t.text_dim,
+         );
+         ui.add_space(12.0);
+-        ui.label("A clean-room, open-source compositor for motion graphics and visual effects: native on macOS, Windows and Linux, and in the browser. Part of the ArtCraft family of creative apps.");
++        ui.label("Custom build based on EffectCraft by the ArtCraft team. This modified build is not an official release.");
+         ui.add_space(14.0);
+         let links: [(Icon, &str, &str, &str); 4] = [
+             (Icon::Chat, "Join the ArtCraft Discord", effectcraft_engine::links::DISCORD, "help.discord"),
